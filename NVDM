@@ -1,0 +1,441 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import math
+import os
+import torch.nn.functional as F
+import sys
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pwd
+
+%cd /content/drive/MyDrive/MLLAB
+
+!ls
+
+!pip install import_ipynb
+import import_ipynb
+
+import utils_pytorch as utils
+
+class NVDM(nn.Module):
+    def __init__(self, vocab_size, n_hidden, n_topic, batch_size, non_linearity):
+        super(NVDM, self).__init__()
+        self.vocab_size = vocab_size # num of vocabulary, 2000
+        self.n_hidden = n_hidden # size of hidden layer, 500
+        self.n_topic = n_topic # number of topics, size of the latent variables h vector. size of the stochastic vector, 50
+        self.non_linearity = non_linearity # nn.ReLU
+        self.batch_size = batch_size # 64
+
+        #self.linear_pi = utils.Linear(self.vocab_size, self.n_hidden, False, True, True) # 64*2000 -> 64*500
+        #self.linear_mu = utils.Linear(self.n_hidden , self.n_topic, bias_start_zero = True, matrix_start_zero = True)   # 64*500 -> 64*50
+        #self.linear_logsig = utils.Linear(self.n_hidden, self.n_topic, bias_start_zero = True, matrix_start_zero = True)# 앞서 mu에서 linear사용했으므로 초기화 필요함
+
+        #self.linear_logit = utils.Linear(self.n_topic, self.vocab_size, bias_start_zero = True, matrix_start_zero = True)
+
+        # 0905 교수님께서 nn.Linear로 바꿔서 실행. 이전 코드에서는 pi에 대해서 학습이 전혀 이루어지지 않았음.
+        self.linear_pi = nn.Linear(self.vocab_size, self.n_hidden)
+        self.linear_mu = nn.Linear(self.n_hidden, self.n_topic)
+        self.linear_logsig = nn.Linear(self.n_hidden, self.n_topic)
+        self.linear_logit = nn.Linear(self.n_topic, self.vocab_size)
+
+    def encoder(self, inputs):
+        # modeled as MLP
+        self.pi = F.tanh(self.linear_pi(inputs)) # Relu는 trianing에서 unstable한 경우가 종종 발생함. by 교수님
+        mu = self.linear_mu(self.pi) # size: batch_size * n_topic
+        logsig = self.linear_logsig(self.pi) # size : batch_size * n_topic
+        #logsig = torch.clamp(logsig, min=-15, max=15) # inf로 값이 발산해서, 최대최소값으로 clamp
+
+        KLD = -0.5 * torch.sum((1 + 2*logsig - torch.square(mu) - torch.exp(2*logsig)),dim=1)
+
+        return mu, logsig, KLD
+
+    def decoder(self,mu,logsig):
+        eps = torch.randn(self.batch_size, self.n_topic).to(device)
+        doc_vec = torch.mul(torch.exp(logsig), eps) + mu # h
+        logits = self.linear_logit(doc_vec) #linear로 h와R의 행렬곱으로 생성된 로짓값들 모임. 단어 개수만큼
+        log_prob = F.log_softmax(logits, dim = 1) # 64*2000
+        # exp 연산으로 인한 overflow 문제가 발생할 수 있기 때문에 NLL(Negative Log Likelihood)에서는 log_softmax사용
+        # 그러나 CEL(cross entropy loss)에서는 생략한다.
+        # log가 아닌 계산도 진행했는데 모두 0으로 결과가 나옴을 알 수 있었다.
+        return doc_vec, log_prob
+
+    def forward(self, inputs):
+        mu, logsig, kld = self.encoder(inputs)
+        doc_vec, log_prob = self.decoder(mu, logsig)
+        reconst_loss = (-1)*torch.sum(log_prob*inputs, 1) # elementwise product, 위에서 log-softmax라서 이미 log
+        # objective = reconst_loss + kld # (64,)
+
+        return reconst_loss, kld
+
+
+R learns the sementic of word embbedings and b represents the bias term
+
+create_batch를 이용해서 batches를 만들고, 그 안에 담긴 정보는 batch별로 각 줄에 들어갈 train set의 index가 담김. 64 * 1 따라서 fetch data를 이용하여 64*2000꼴로 변형한다.
+
+train_count는 아마도 document별 단어 수
+
+train_set, train_count = utils.data_set('train.feat')
+test_set, test_count = utils.data_set('test.feat')
+
+아래에서 사용하는 data_batches의 shape은 64*2000 (batch_size , vocab_num)
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+model = NVDM(2000, 500, 50, 64, nn.ReLU).to(device) # vocab_size, n_hidden, n_vocab, learning_rate, batch_size
+#batch
+batch_size = 64
+# epoch
+training_epoch = 100
+# optimizer
+encoder_optimizer = torch.optim.Adam(list(model.linear_pi.parameters()) +
+                                     list(model.linear_mu.parameters()) +
+                                     list(model.linear_logsig.parameters())
+                                     ,lr = 1e-4
+                                     )
+decoder_optimizer = torch.optim.Adam(model.linear_logit.parameters(),lr = 1e-4)
+# scheduler
+#encoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = encoder_optimizer, base_lr = 5e-5, step_size_up = 5, max_lr = 1e-3, mode = 'triangular', cycle_momentum=False)
+#decoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = decoder_optimizer, base_lr = 5e-4, step_size_up = 5, max_lr = 1e-3, mode = 'triangular', cycle_momentum=False)
+# data
+training_batches = utils.create_batches(len(train_set), batch_size, shuffle = False)
+
+train_loss_list = list()
+outputs = []
+
+for epoch in range(training_epoch):
+
+    model.train()
+    training_batches = utils.create_batches(len(train_set), batch_size, shuffle = True)
+
+    loss_sum = 0
+    kld_sum = 0
+    w_cnt = 0
+    doc_cnt = 0
+    ppx_sum = 0
+
+    for idx_batch in training_batches:
+
+        data_batches, cnt_batches, mask = utils.fetch_data(train_set, train_count, idx_batch, 2000)
+        data_batches = torch.Tensor(data_batches).to(device)
+        #mu, logsig, kld = model.encoder(data_batches)
+        #doc_vec, prob = model.decoder(mu, logsig)
+        # 마지막 batch의 개수가 4개라서 많은 일이 있었다가 해결..
+        # The size of tensor a (4) must match the size of tensor b (64) at non-singleton dimension 0 중간에 print문으로 size, shape 확인으로 debugging
+        # batch size로 전체 데이터 개수가 나누어떨어지지 않아서 문제가 생겼음.
+        # utils에서 fetch data를 수정해서 해결 : math.ceil -> math.floor
+        reconst_loss, kld = model.forward(data_batches)
+
+        cnt_batches = np.add(cnt_batches,1e-12)
+        mask = torch.Tensor(mask).to(device)
+        cnt_batches = torch.Tensor(cnt_batches).to(device)
+        w_cnt += torch.sum(cnt_batches)
+
+        kld = kld*mask
+        objective = reconst_loss+kld
+        loss = torch.sum(objective)
+
+        # optimizer.zero_grad의 option?에서 gradient clamp를 시도해 보는 것도 방법. Relu에서 inf로 발산하거나 너무 작아지는 것 막아줌
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
+
+        loss.backward()
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+
+        loss_sum += loss.item()
+        kld_sum += kld/torch.sum(mask)
+        ppx_sum += torch.sum(torch.div(objective, cnt_batches)) # 글자수로 objective 나눠줌
+
+
+        doc_cnt += torch.sum(mask)
+        objective_m = torch.mean(objective)
+
+
+
+
+        #sys.exit()
+
+    #encoder_scheduler.step()
+    #decoder_scheduler.step()
+    ppx = torch.exp(loss_sum/w_cnt)
+    ppx_perdoc = torch.exp(ppx_sum / doc_cnt)
+    aver_loss = loss_sum/doc_cnt
+
+    model.eval()
+
+    test_batch_size = 64
+    test_loss_sum = 0
+    test_kld_sum = 0
+    test_w_cnt = 0
+    test_doc_cnt = 0
+    test_ppx_sum = 0
+
+    with torch.no_grad():
+        testing_batch = utils.create_batches(len(test_set), test_batch_size, shuffle = False)
+        for idx_batch in testing_batch:
+            test_data_batches, test_cnt_batches, test_mask = utils.fetch_data(test_set, test_count, idx_batch, 2000)
+            test_data_batches = torch.Tensor(test_data_batches).to(device)
+            #test_mu, test_logsig, test_kld = model.encoder(test_data_batches)
+            #test_h, test_prob = model.decoder(test_mu, test_logsig)
+
+            test_reconst_loss, test_kld = model.forward(test_data_batches)
+
+            test_cnt_batches = np.add(test_cnt_batches, 1e-12)
+            test_mask = torch.Tensor(test_mask).to(device)
+            test_cnt_batches = torch.Tensor(test_cnt_batches).to(device)
+            test_w_cnt += torch.sum(test_cnt_batches)
+
+            test_kld = test_kld*test_mask
+            test_objective = test_reconst_loss + test_kld
+            test_loss = torch.sum(test_objective)
+
+
+            test_loss_sum += test_loss
+            test_kld_sum += test_kld/torch.sum(test_mask)
+            test_ppx_sum += torch.sum(torch.divide(test_objective, test_cnt_batches))
+            test_doc_cnt += torch.sum(test_mask)
+        test_ppx = torch.exp(test_loss_sum/test_w_cnt)
+        test_ppx_perdoc = torch.exp(test_ppx_sum / test_doc_cnt)
+        test_aver_loss = test_loss_sum/test_doc_cnt
+
+
+    if epoch % 5 == 4:
+        print(f"Train, Epoch [{epoch+1}/{training_epoch}], Loss: {aver_loss:.4f}, perplexity : {ppx_perdoc}")
+        print(f"Test, Loss: {test_aver_loss :.4f}, perplexity : {test_ppx_perdoc}")
+
+
+print(list(model.linear_pi.parameters()))
+print(list(model.linear_mu.parameters()))
+print(list(model.linear_logsig.parameters()))
+print(list(model.linear_logit.parameters()))
+
+#batch
+batch_size = 64
+# epoch
+training_epoch = 900
+# optimizer
+encoder_optimizer = torch.optim.Adam(list(model.linear_pi.parameters()) +
+                                     list(model.linear_mu.parameters()) +
+                                     list(model.linear_logsig.parameters())
+                                     ,lr = 5e-5
+                                     )
+decoder_optimizer = torch.optim.Adam(model.linear_logit.parameters(),lr = 5e-5)
+# scheduler
+#encoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = encoder_optimizer, base_lr = 5e-5, step_size_up = 10, max_lr = 5e-4, mode = 'triangular', cycle_momentum=False)
+#decoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = decoder_optimizer, base_lr = 5e-5, step_size_up = 10, max_lr = 5e-4, mode = 'triangular', cycle_momentum=False)
+# data
+training_batches = utils.create_batches(len(train_set), batch_size, shuffle = False)
+
+train_loss_list = list()
+outputs = []
+
+for epoch in range(training_epoch):
+
+    model.train()
+    training_batches = utils.create_batches(len(train_set), batch_size, shuffle = True)
+
+    loss_sum = 0
+    kld_sum = 0
+    w_cnt = 0
+    doc_cnt = 0
+    ppx_sum = 0
+
+    for idx_batch in training_batches:
+
+        data_batches, cnt_batches, mask = utils.fetch_data(train_set, train_count, idx_batch, 2000)
+        data_batches = torch.Tensor(data_batches).to(device)
+        #mu, logsig, kld = model.encoder(data_batches)
+        #doc_vec, prob = model.decoder(mu, logsig)
+        # 마지막 batch의 개수가 4개라서 많은 일이 있었다가 해결..
+        # The size of tensor a (4) must match the size of tensor b (64) at non-singleton dimension 0 중간에 print문으로 size, shape 확인으로 debugging
+        # batch size로 전체 데이터 개수가 나누어떨어지지 않아서 문제가 생겼음.
+        # utils에서 fetch data를 수정해서 해결 : math.ceil -> math.floor
+        reconst_loss, kld = model.forward(data_batches)
+
+        cnt_batches = np.add(cnt_batches,1e-12)
+        mask = torch.Tensor(mask).to(device)
+        cnt_batches = torch.Tensor(cnt_batches).to(device)
+        w_cnt += torch.sum(cnt_batches)
+
+        kld = kld*mask
+        objective = reconst_loss+kld
+        loss = torch.sum(objective)
+
+        loss_sum += loss
+        kld_sum += kld/torch.sum(mask)
+        ppx_sum += torch.sum(torch.div(objective, cnt_batches)) # 글자수로 objective 나눠줌
+
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
+        doc_cnt += torch.sum(mask)
+        objective_m = torch.mean(objective)
+
+        loss.backward()
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+    #encoder_scheduler.step()
+    #decoder_scheduler.step()
+    ppx = torch.exp(loss_sum/w_cnt)
+    ppx_perdoc = torch.exp(ppx_sum / doc_cnt)
+    aver_loss = loss_sum/doc_cnt
+
+    model.eval()
+
+    test_batch_size = 64
+    test_loss_sum = 0
+    test_kld_sum = 0
+    test_w_cnt = 0
+    test_doc_cnt = 0
+    test_ppx_sum = 0
+
+    with torch.no_grad():
+        testing_batch = utils.create_batches(len(test_set), test_batch_size, shuffle = False)
+        for idx_batch in testing_batch:
+            test_data_batches, test_cnt_batches, test_mask = utils.fetch_data(test_set, test_count, idx_batch, 2000)
+            test_data_batches = torch.Tensor(test_data_batches).to(device)
+            #test_mu, test_logsig, test_kld = model.encoder(test_data_batches)
+            #test_h, test_prob = model.decoder(test_mu, test_logsig)
+
+            test_reconst_loss, test_kld = model.forward(test_data_batches)
+
+            test_cnt_batches = np.add(test_cnt_batches, 1e-12)
+            test_mask = torch.Tensor(test_mask).to(device)
+            test_cnt_batches = torch.Tensor(test_cnt_batches).to(device)
+            test_w_cnt += torch.sum(test_cnt_batches)
+
+            test_kld = test_kld*test_mask
+            test_objective = test_reconst_loss + test_kld
+            test_loss = torch.sum(test_objective)
+
+
+            test_loss_sum += test_loss
+            test_kld_sum += test_kld/torch.sum(test_mask)
+            test_ppx_sum += torch.sum(torch.divide(test_objective, test_cnt_batches))
+            test_doc_cnt += torch.sum(test_mask)
+        test_ppx = torch.exp(test_loss_sum/test_w_cnt)
+        test_ppx_perdoc = torch.exp(test_ppx_sum / test_doc_cnt)
+        test_aver_loss = test_loss_sum/test_doc_cnt
+
+
+    if epoch % 5 == 4:
+        print(f"Train, Epoch [{epoch+1}/{training_epoch}], Loss: {aver_loss:.4f}, perplexity : {ppx_perdoc}")
+        print(f"Test, Loss: {test_aver_loss :.4f}, perplexity : {test_ppx_perdoc}")
+
+
+아래의 코드는 epoch 1000을 저자의 코드와 동일하게 lr 5e-5로, encoder, decoder의 optimizer를 따로 설정하여 진행한 것이다.
+
+model = NVDM(2000, 500, 50, 64, nn.ReLU) # vocab_size, n_hidden, n_vocab, learning_rate, batch_size
+#batch
+batch_size = 64
+# epoch
+training_epoch = 1000
+# optimizer
+encoder_optimizer = torch.optim.Adam(list(model.linear_pi.parameters()) +
+                                     list(model.linear_mu.parameters()) +
+                                     list(model.linear_logsig.parameters())
+                                     ,lr = 5e-5
+                                     )
+decoder_optimizer = torch.optim.Adam(model.linear_logit.parameters(),lr = 5e-5)
+# scheduler
+#encoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = encoder_optimizer, base_lr = 5e-5, step_size_up = 10, max_lr = 5e-4, mode = 'triangular', cycle_momentum=False)
+#decoder_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer = decoder_optimizer, base_lr = 5e-5, step_size_up = 10, max_lr = 5e-4, mode = 'triangular', cycle_momentum=False)
+# data
+training_batches = utils.create_batches(len(train_set), batch_size, shuffle = False)
+
+train_loss_list = list()
+outputs = []
+
+for epoch in range(training_epoch):
+
+    model.train()
+    training_batches = utils.create_batches(len(train_set), batch_size, shuffle = True)
+
+    loss_sum = 0
+    kld_sum = 0
+    w_cnt = 0
+    doc_cnt = 0
+    ppx_sum = 0
+
+    for idx_batch in training_batches:
+
+        data_batches, cnt_batches, mask = utils.fetch_data(train_set, train_count, idx_batch, 2000)
+        data_batches = torch.Tensor(data_batches)
+        mu, logsig, kld = model.encoder(data_batches)
+        doc_vec, prob = model.decoder(mu, logsig)
+        # 마지막 batch의 개수가 4개라서 많은 일이 있었다가 해결..
+        # The size of tensor a (4) must match the size of tensor b (64) at non-singleton dimension 0 중간에 print문으로 size, shape 확인으로 debugging
+        # batch size로 전체 데이터 개수가 나누어떨어지지 않아서 문제가 생겼음.
+        # utils에서 fetch data를 수정해서 해결 : math.ceil -> math.floor
+        reconst_loss = model.forward(data_batches)
+
+        cnt_batches = np.add(cnt_batches,1e-12)
+        mask = torch.Tensor(mask)
+        cnt_batches = torch.Tensor(cnt_batches)
+        w_cnt += torch.sum(cnt_batches)
+
+        kld = kld*mask
+        objective = reconst_loss+kld
+        loss = torch.sum(objective)
+
+        loss_sum += loss
+        kld_sum += kld/torch.sum(mask)
+        ppx_sum += torch.sum(torch.div(objective, cnt_batches)) # 글자수로 objective 나눠줌
+
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
+        doc_cnt += torch.sum(mask)
+        objective_m = torch.mean(objective)
+
+        loss.backward()
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+    #encoder_scheduler.step()
+    #decoder_scheduler.step()
+    ppx = torch.exp(loss_sum/w_cnt)
+    ppx_perdoc = torch.exp(ppx_sum / doc_cnt)
+    aver_loss = loss_sum/doc_cnt
+
+    model.eval()
+
+    test_batch_size = 64
+    test_loss_sum = 0
+    test_kld_sum = 0
+    test_w_cnt = 0
+    test_doc_cnt = 0
+    test_ppx_sum = 0
+
+    with torch.no_grad():
+        testing_batch = utils.create_batches(len(test_set), test_batch_size, shuffle = False)
+        for idx_batch in testing_batch:
+            test_data_batches, test_cnt_batches, test_mask = utils.fetch_data(test_set, test_count, idx_batch, 2000)
+            test_data_batches = torch.Tensor(test_data_batches)
+            test_mu, test_logsig, test_kld = model.encoder(test_data_batches)
+            test_h, test_prob = model.decoder(test_mu, test_logsig)
+
+            test_reconst_loss = model.forward(test_data_batches)
+
+            test_cnt_batches = np.add(test_cnt_batches, 1e-12)
+            test_mask = torch.Tensor(test_mask)
+            test_cnt_batches = torch.Tensor(test_cnt_batches)
+            test_w_cnt += torch.sum(test_cnt_batches)
+
+            test_kld = test_kld*test_mask
+            test_objective = test_reconst_loss + test_kld
+            test_loss = torch.sum(test_objective)
+
+
+            test_loss_sum += test_loss
+            test_kld_sum += test_kld/torch.sum(test_mask)
+            test_ppx_sum += torch.sum(torch.divide(test_objective, test_cnt_batches))
+            test_doc_cnt += torch.sum(test_mask)
+        test_ppx = torch.exp(test_loss_sum/test_w_cnt)
+        test_ppx_perdoc = torch.exp(test_ppx_sum / test_doc_cnt)
+        test_aver_loss = test_loss_sum/test_doc_cnt
+
+
+    if epoch % 5 == 4:
+        print(f"Train, Epoch [{epoch+1}/{training_epoch}], Loss: {aver_loss:.4f}, perplexity : {ppx_perdoc}")
+        print(f"Test, Loss: {test_aver_loss :.4f}, perplexity : {test_ppx_perdoc}")
